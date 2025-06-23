@@ -168,7 +168,7 @@ static HRESULT hkCreateDXGIFactory1(REFIID riid, IDXGIFactory1** ppFactory);
 static HRESULT hkCreateDXGIFactory2(UINT Flags, REFIID riid, IDXGIFactory2** ppFactory);
 
 static IID streamlineRiid {};
-static bool CheckForRealObject(std::string functionName, IUnknown* pObject, IUnknown** ppRealObject)
+static bool CheckForRealObject(std::string_view functionName, IUnknown* pObject, void** ppRealObject) // works for all and is non-ambiguous
 {
 #ifdef CHECK_FOR_SL_PROXY_OBJECTS
     if (streamlineRiid.Data1 == 0)
@@ -179,17 +179,32 @@ static bool CheckForRealObject(std::string functionName, IUnknown* pObject, IUnk
             return false;
     }
 
-    auto qResult = pObject->QueryInterface(streamlineRiid, (void**) ppRealObject);
+    auto qResult = pObject->QueryInterface(streamlineRiid, ppRealObject);
 
     if (qResult == S_OK && *ppRealObject != nullptr)
     {
         LOG_INFO("{} Streamline proxy found!", functionName);
-        (*ppRealObject)->Release();
+        ((IUnknown**) *ppRealObject)->Release();
         return true;
     }
 #endif
 
     return false;
+}
+
+static void prepareSwapChainBuffers(decltype(State::Instance().SCbuffers)& buffers, size_t count,
+                                    IDXGISwapChain* pSwapChain)
+{
+    buffers.clear();
+    buffers.reserve(count);
+    for (size_t i = 0; i < count; i++)
+    {
+        Util::ComPtr<IUnknown> buffer;
+        if (pSwapChain->GetBuffer(i, IID_OUTPTR_ARGS(std::out_ptr(buffer))) == S_OK)
+        {
+            buffers.push_back(buffer.release()); // TODO memory leak?
+        }
+    }
 }
 
 #pragma region Callbacks for wrapped swapchain
@@ -365,12 +380,12 @@ static HRESULT Present(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT Flags
     //    return presentResult;
     // }
 
-    ID3D12CommandQueue* cq = nullptr;
-    ID3D11Device* device = nullptr;
-    ID3D12Device* device12 = nullptr;
+    Util::ComPtr<ID3D12CommandQueue> cq;
+    Util::ComPtr<ID3D11Device> device;
+    Util::ComPtr<ID3D12Device> device12;
 
     // try to obtain directx objects and find the path
-    if (pDevice->QueryInterface(IID_PPV_ARGS(&device)) == S_OK)
+    if (pDevice->QueryInterface(IID_OUTPTR_ARGS(std::out_ptr(device))) == S_OK)
     {
         if (!_dx11Device)
             LOG_DEBUG("D3D11Device captured");
@@ -378,15 +393,15 @@ static HRESULT Present(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT Flags
         _dx11Device = true;
         State::Instance().swapchainApi = DX11;
     }
-    else if (pDevice->QueryInterface(IID_PPV_ARGS(&cq)) == S_OK)
+    else if (pDevice->QueryInterface(IID_OUTPTR_ARGS(std::out_ptr(cq))) == S_OK)
     {
         if (!_dx12Device)
             LOG_DEBUG("D3D12CommandQueue captured");
 
-        State::Instance().currentCommandQueue = cq;
+        State::Instance().currentCommandQueue = cq.get();
         State::Instance().swapchainApi = DX12;
 
-        if (cq->GetDevice(IID_PPV_ARGS(&device12)) == S_OK)
+        if (cq->GetDevice(IID_OUTPTR_ARGS(std::out_ptr(device12))) == S_OK)
         {
             if (!_dx12Device)
                 LOG_DEBUG("D3D12Device captured");
@@ -482,15 +497,6 @@ static HRESULT Present(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT Flags
     // DXVK check, it's here because of upscaler time calculations
     if (State::Instance().isRunningOnDXVK)
     {
-        if (cq != nullptr)
-            cq->Release();
-
-        if (device != nullptr)
-            device->Release();
-
-        if (device12 != nullptr)
-            device12->Release();
-
         if (pPresentParameters == nullptr)
             presentResult = pSwapChain->Present(SyncInterval, Flags);
         else
@@ -526,16 +532,6 @@ static HRESULT Present(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT Flags
         presentResult = pSwapChain->Present(SyncInterval, Flags);
     else
         presentResult = ((IDXGISwapChain1*) pSwapChain)->Present1(SyncInterval, Flags, pPresentParameters);
-
-    // release used objects
-    if (cq != nullptr)
-        cq->Release();
-
-    if (device != nullptr)
-        device->Release();
-
-    if (device12 != nullptr)
-        device12->Release();
 
     if (presentResult == S_OK)
         LOG_TRACE("4 {}, Present result: {:X}", _frameCounter, (UINT) presentResult);
@@ -580,22 +576,18 @@ static void CheckAdapter(IUnknown* unkAdapter)
     // DXVK VkInterface GUID
     const GUID guid = { 0x907bf281, 0xea3c, 0x43b4, { 0xa8, 0xe4, 0x9f, 0x23, 0x11, 0x07, 0xb4, 0xff } };
 
-    IDXGIAdapter* adapter = nullptr;
-    bool adapterOk = unkAdapter->QueryInterface(IID_PPV_ARGS(&adapter)) == S_OK;
+    Util::ComPtr<IDXGIAdapter> adapter;
+    bool adapterOk = unkAdapter->QueryInterface(IID_OUTPTR_ARGS(std::out_ptr(adapter))) == S_OK;
 
-    void* dxvkAdapter = nullptr;
-    if (adapterOk && adapter->QueryInterface(guid, &dxvkAdapter) == S_OK)
+    Util::ComPtr<IDXGIAdapter> dxvkAdapter;
+    if (adapterOk && adapter->QueryInterface(guid, std::out_ptr(dxvkAdapter)) == S_OK)
     {
         State::Instance().isRunningOnDXVK = dxvkAdapter != nullptr;
-        ((IDXGIAdapter*) dxvkAdapter)->Release();
 
         // Temporary fix for Linux & DXVK
         if (State::Instance().isRunningOnDXVK || State::Instance().isRunningOnLinux)
             Config::Instance()->UseHQFont.set_volatile_value(false);
     }
-
-    if (adapterOk)
-        adapter->Release();
 }
 
 static HRESULT hkCreateSwapChainForCoreWindow(IDXGIFactory2* pFactory, IUnknown* pDevice, IUnknown* pWindow,
@@ -670,21 +662,21 @@ static HRESULT hkCreateSwapChainForCoreWindow(IDXGIFactory2* pFactory, IUnknown*
     if (result == S_OK)
     {
         // check for SL proxy
-        IDXGISwapChain* realSC = nullptr;
-        if (!CheckForRealObject(__FUNCTION__, *ppSwapChain, (IUnknown**) &realSC))
-            realSC = *ppSwapChain;
+        Util::ComPtr<IDXGISwapChain> realSC;
+        if (!CheckForRealObject(__FUNCTION__, *ppSwapChain, std::out_ptr(realSC)))
+            realSC.reset(*ppSwapChain);
 
-        IUnknown* readDevice = nullptr;
-        if (!CheckForRealObject(__FUNCTION__, pDevice, (IUnknown**) &readDevice))
-            readDevice = pDevice;
+        Util::ComPtr<IUnknown> readDevice;
+        if (!CheckForRealObject(__FUNCTION__, pDevice, std::out_ptr(readDevice)))
+            readDevice.reset(pDevice);
 
         State::Instance().screenWidth = pDesc->Width;
         State::Instance().screenHeight = pDesc->Height;
 
         LOG_DEBUG("Created new swapchain: {0:X}, hWnd: {1:X}", (UINT64) *ppSwapChain, (UINT64) pWindow);
         *ppSwapChain =
-            new WrappedIDXGISwapChain4(realSC, readDevice, (HWND) pWindow, Present, MenuOverlayDx::CleanupRenderTarget,
-                                       HooksDx::ReleaseDx12SwapChain, true);
+            new WrappedIDXGISwapChain4(realSC.release(), readDevice.release(), (HWND) pWindow, Present,
+                                       MenuOverlayDx::CleanupRenderTarget, HooksDx::ReleaseDx12SwapChain, true);
 
         if (!_skipFGSwapChainCreation)
             State::Instance().currentSwapchain = *ppSwapChain;
@@ -697,22 +689,13 @@ static HRESULT hkCreateSwapChainForCoreWindow(IDXGIFactory2* pFactory, IUnknown*
         {
             if (!_skipFGSwapChainCreation)
             {
-                State::Instance().SCbuffers.clear();
-                for (size_t i = 0; i < pDesc->BufferCount; i++)
-                {
-                    IUnknown* buffer;
-                    if ((*ppSwapChain)->GetBuffer(i, IID_PPV_ARGS(&buffer)) == S_OK)
-                    {
-                        State::Instance().SCbuffers.push_back(buffer);
-                        buffer->Release();
-                    }
-                }
+                prepareSwapChainBuffers(State::Instance().SCbuffers, pDesc->BufferCount, *ppSwapChain);
             }
 
-            IDXGISwapChain3* sc3 = nullptr;
+            Util::ComPtr<IDXGISwapChain3> sc3;
             do
             {
-                if ((*ppSwapChain)->QueryInterface(IID_PPV_ARGS(&sc3)) == S_OK)
+                if ((*ppSwapChain)->QueryInterface(IID_OUTPTR_ARGS(std::out_ptr(sc3))) == S_OK)
                 {
                     DXGI_COLOR_SPACE_TYPE hdrCS = DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709;
 
@@ -744,9 +727,6 @@ static HRESULT hkCreateSwapChainForCoreWindow(IDXGIFactory2* pFactory, IUnknown*
                 }
 
             } while (false);
-
-            if (sc3 != nullptr)
-                sc3->Release();
         }
     }
 
@@ -821,12 +801,11 @@ static HRESULT hkCreateSwapChain(IDXGIFactory* pFactory, IUnknown* pDevice, DXGI
         pDesc->Flags |= DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
     }
 
-    ID3D12CommandQueue* cq = nullptr;
+    Util::ComPtr<ID3D12CommandQueue> cq;
     if (Config::Instance()->OverlayMenu.value_or_default() && State::Instance().activeFgType == FGType::OptiFG &&
-        !_skipFGSwapChainCreation && FfxApiProxy::InitFfxDx12() && pDevice->QueryInterface(IID_PPV_ARGS(&cq)) == S_OK)
+        !_skipFGSwapChainCreation && FfxApiProxy::InitFfxDx12() && pDevice->QueryInterface(IID_OUTPTR_ARGS(std::out_ptr(cq))) == S_OK)
     {
         cq->SetName(L"GameQueue");
-        cq->Release();
 
         // FG Init
         if (State::Instance().currentFG == nullptr)
@@ -836,15 +815,15 @@ static HRESULT hkCreateSwapChain(IDXGIFactory* pFactory, IUnknown* pDevice, DXGI
 
         auto fg = reinterpret_cast<IFGFeature_Dx12*>(State::Instance().currentFG);
 
-        ID3D12CommandQueue* real = nullptr;
-        if (!CheckForRealObject(__FUNCTION__, pDevice, (IUnknown**) &real))
-            real = (ID3D12CommandQueue*) pDevice;
+        Util::ComPtr<ID3D12CommandQueue> real;
+        if (!CheckForRealObject(__FUNCTION__, pDevice, std::out_ptr(real)))
+            real.reset((ID3D12CommandQueue*) pDevice);
 
         _skipFGSwapChainCreation = true;
         State::Instance().skipHeapCapture = true;
         State::Instance().skipDxgiLoadChecks = true;
 
-        auto scResult = fg->CreateSwapchain(pFactory, real, pDesc, ppSwapChain);
+        auto scResult = fg->CreateSwapchain(pFactory, real.release(), pDesc, ppSwapChain); // TODO memory leak?
 
         State::Instance().skipDxgiLoadChecks = false;
         State::Instance().skipHeapCapture = false;
@@ -871,24 +850,15 @@ static HRESULT hkCreateSwapChain(IDXGIFactory* pFactory, IUnknown* pDevice, DXGI
                 }
             }
 
-            State::Instance().SCbuffers.clear();
-            for (size_t i = 0; i < 3; i++)
-            {
-                IUnknown* buffer;
-                if ((*ppSwapChain)->GetBuffer(i, IID_PPV_ARGS(&buffer)) == S_OK)
-                {
-                    State::Instance().SCbuffers.push_back(buffer);
-                    buffer->Release();
-                }
-            }
+            prepareSwapChainBuffers(State::Instance().SCbuffers, 3, *ppSwapChain);
 
             if (Config::Instance()->ForceHDR.value_or_default())
             {
-                IDXGISwapChain3* sc3 = nullptr;
+                Util::ComPtr<IDXGISwapChain3> sc3;
 
                 do
                 {
-                    if ((*ppSwapChain)->QueryInterface(IID_PPV_ARGS(&sc3)) == S_OK)
+                    if ((*ppSwapChain)->QueryInterface(IID_OUTPTR_ARGS(std::out_ptr(sc3))) == S_OK)
                     {
                         DXGI_COLOR_SPACE_TYPE hdrCS = DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709;
 
@@ -920,9 +890,6 @@ static HRESULT hkCreateSwapChain(IDXGIFactory* pFactory, IUnknown* pDevice, DXGI
                     }
 
                 } while (false);
-
-                if (sc3 != nullptr)
-                    sc3->Release();
             }
 
             State::Instance().currentSwapchain = (*ppSwapChain);
@@ -950,13 +917,13 @@ static HRESULT hkCreateSwapChain(IDXGIFactory* pFactory, IUnknown* pDevice, DXGI
     if (result == S_OK)
     {
         // check for SL proxy
-        IDXGISwapChain* realSC = nullptr;
-        if (!CheckForRealObject(__FUNCTION__, *ppSwapChain, (IUnknown**) &realSC))
-            realSC = *ppSwapChain;
+        Util::ComPtr<IDXGISwapChain> realSC;
+        if (!CheckForRealObject(__FUNCTION__, *ppSwapChain, std::out_ptr(realSC)))
+            realSC.reset(*ppSwapChain);
 
-        IUnknown* readDevice = nullptr;
-        if (!CheckForRealObject(__FUNCTION__, pDevice, (IUnknown**) &readDevice))
-            readDevice = pDevice;
+        Util::ComPtr<IUnknown> readDevice;
+        if (!CheckForRealObject(__FUNCTION__, pDevice, std::out_ptr(readDevice)))
+            readDevice.reset(pDevice);
 
         if (Util::GetProcessWindow() == pDesc->OutputWindow)
         {
@@ -966,7 +933,7 @@ static HRESULT hkCreateSwapChain(IDXGIFactory* pFactory, IUnknown* pDevice, DXGI
 
         LOG_DEBUG("Created new swapchain: {0:X}, hWnd: {1:X}", (UINT64) *ppSwapChain, (UINT64) pDesc->OutputWindow);
         *ppSwapChain =
-            new WrappedIDXGISwapChain4(realSC, readDevice, pDesc->OutputWindow, Present,
+            new WrappedIDXGISwapChain4(realSC.get(), readDevice.release(), pDesc->OutputWindow, Present,
                                        MenuOverlayDx::CleanupRenderTarget, HooksDx::ReleaseDx12SwapChain, false);
 
         if (!_skipFGSwapChainCreation)
@@ -980,22 +947,13 @@ static HRESULT hkCreateSwapChain(IDXGIFactory* pFactory, IUnknown* pDevice, DXGI
         {
             if (!_skipFGSwapChainCreation)
             {
-                State::Instance().SCbuffers.clear();
-                for (size_t i = 0; i < pDesc->BufferCount; i++)
-                {
-                    IUnknown* buffer;
-                    if ((*ppSwapChain)->GetBuffer(i, IID_PPV_ARGS(&buffer)) == S_OK)
-                    {
-                        State::Instance().SCbuffers.push_back(buffer);
-                        buffer->Release();
-                    }
-                }
+                prepareSwapChainBuffers(State::Instance().SCbuffers, pDesc->BufferCount, *ppSwapChain);
             }
 
-            IDXGISwapChain3* sc3 = nullptr;
+            Util::ComPtr<IDXGISwapChain3> sc3;
             do
             {
-                if ((*ppSwapChain)->QueryInterface(IID_PPV_ARGS(&sc3)) == S_OK)
+                if ((*ppSwapChain)->QueryInterface(IID_OUTPTR_ARGS(std::out_ptr(sc3))) == S_OK)
                 {
                     DXGI_COLOR_SPACE_TYPE hdrCS = DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709;
 
@@ -1027,9 +985,6 @@ static HRESULT hkCreateSwapChain(IDXGIFactory* pFactory, IUnknown* pDevice, DXGI
                 }
 
             } while (false);
-
-            if (sc3 != nullptr)
-                sc3->Release();
         }
     }
 
@@ -1093,12 +1048,11 @@ static HRESULT hkCreateSwapChainForHwnd(IDXGIFactory* This, IUnknown* pDevice, H
         pDesc->Flags |= DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
     }
 
-    ID3D12CommandQueue* cq = nullptr;
+    Util::ComPtr<ID3D12CommandQueue> cq;
     if (State::Instance().activeFgType == FGType::OptiFG && !_skipFGSwapChainCreation && FfxApiProxy::InitFfxDx12() &&
-        pDevice->QueryInterface(IID_PPV_ARGS(&cq)) == S_OK)
+        pDevice->QueryInterface(IID_OUTPTR_ARGS(std::out_ptr(cq))) == S_OK)
     {
         cq->SetName(L"GameQueueHwnd");
-        cq->Release();
 
         // FG Init
         if (State::Instance().currentFG == nullptr)
@@ -1108,15 +1062,15 @@ static HRESULT hkCreateSwapChainForHwnd(IDXGIFactory* This, IUnknown* pDevice, H
 
         auto fg = reinterpret_cast<IFGFeature_Dx12*>(State::Instance().currentFG);
 
-        ID3D12CommandQueue* real = nullptr;
-        if (!CheckForRealObject(__FUNCTION__, pDevice, (IUnknown**) &real))
-            real = (ID3D12CommandQueue*) pDevice;
+        Util::ComPtr<ID3D12CommandQueue> real;
+        if (!CheckForRealObject(__FUNCTION__, pDevice, std::out_ptr(real)))
+            real.reset((ID3D12CommandQueue*) pDevice);
 
         _skipFGSwapChainCreation = true;
         State::Instance().skipHeapCapture = true;
         State::Instance().skipDxgiLoadChecks = true;
 
-        auto scResult = fg->CreateSwapchain1(This, real, hWnd, pDesc, pFullscreenDesc, ppSwapChain);
+        auto scResult = fg->CreateSwapchain1(This, real.get(), hWnd, pDesc, pFullscreenDesc, ppSwapChain);
 
         State::Instance().skipDxgiLoadChecks = false;
         State::Instance().skipHeapCapture = false;
@@ -1143,24 +1097,15 @@ static HRESULT hkCreateSwapChainForHwnd(IDXGIFactory* This, IUnknown* pDevice, H
                 }
             }
 
-            State::Instance().SCbuffers.clear();
-            for (size_t i = 0; i < 3; i++)
-            {
-                IUnknown* buffer;
-                if ((*ppSwapChain)->GetBuffer(i, IID_PPV_ARGS(&buffer)) == S_OK)
-                {
-                    State::Instance().SCbuffers.push_back(buffer);
-                    buffer->Release();
-                }
-            }
+            prepareSwapChainBuffers(State::Instance().SCbuffers, 3, *ppSwapChain);
 
             if (Config::Instance()->ForceHDR.value_or_default())
             {
-                IDXGISwapChain3* sc3 = nullptr;
+                Util::ComPtr<IDXGISwapChain3> sc3;
 
                 do
                 {
-                    if ((*ppSwapChain)->QueryInterface(IID_PPV_ARGS(&sc3)) == S_OK)
+                    if ((*ppSwapChain)->QueryInterface(IID_OUTPTR_ARGS(std::out_ptr(sc3))) == S_OK)
                     {
                         DXGI_COLOR_SPACE_TYPE hdrCS = DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709;
 
@@ -1192,9 +1137,6 @@ static HRESULT hkCreateSwapChainForHwnd(IDXGIFactory* This, IUnknown* pDevice, H
                     }
 
                 } while (false);
-
-                if (sc3 != nullptr)
-                    sc3->Release();
             }
 
             State::Instance().currentSwapchain = (*ppSwapChain);
@@ -1221,13 +1163,13 @@ static HRESULT hkCreateSwapChainForHwnd(IDXGIFactory* This, IUnknown* pDevice, H
     if (result == S_OK)
     {
         // check for SL proxy
-        IDXGISwapChain1* realSC = nullptr;
-        if (!CheckForRealObject(__FUNCTION__, *ppSwapChain, (IUnknown**) &realSC))
-            realSC = *ppSwapChain;
+        Util::ComPtr<IDXGISwapChain1> realSC;
+        if (!CheckForRealObject(__FUNCTION__, *ppSwapChain, std::out_ptr(realSC)))
+            realSC.reset(*ppSwapChain);
 
-        IUnknown* readDevice = nullptr;
-        if (!CheckForRealObject(__FUNCTION__, pDevice, (IUnknown**) &readDevice))
-            readDevice = pDevice;
+        Util::ComPtr<IUnknown> readDevice;
+        if (!CheckForRealObject(__FUNCTION__, pDevice, std::out_ptr(readDevice)))
+            readDevice.reset(pDevice);
 
         if (Util::GetProcessWindow() == hWnd)
         {
@@ -1236,7 +1178,7 @@ static HRESULT hkCreateSwapChainForHwnd(IDXGIFactory* This, IUnknown* pDevice, H
         }
 
         LOG_DEBUG("Created new swapchain: {0:X}, hWnd: {1:X}", (UINT64) *ppSwapChain, (UINT64) hWnd);
-        *ppSwapChain = new WrappedIDXGISwapChain4(realSC, readDevice, hWnd, Present, MenuOverlayDx::CleanupRenderTarget,
+        *ppSwapChain = new WrappedIDXGISwapChain4(realSC.get(), readDevice.get(), hWnd, Present, MenuOverlayDx::CleanupRenderTarget,
                                                   HooksDx::ReleaseDx12SwapChain, false);
         LOG_DEBUG("Created new WrappedIDXGISwapChain4: {0:X}, pDevice: {1:X}", (UINT64) *ppSwapChain, (UINT64) pDevice);
 
@@ -1247,22 +1189,13 @@ static HRESULT hkCreateSwapChainForHwnd(IDXGIFactory* This, IUnknown* pDevice, H
         {
             if (!_skipFGSwapChainCreation)
             {
-                State::Instance().SCbuffers.clear();
-                for (size_t i = 0; i < pDesc->BufferCount; i++)
-                {
-                    IUnknown* buffer;
-                    if ((*ppSwapChain)->GetBuffer(i, IID_PPV_ARGS(&buffer)) == S_OK)
-                    {
-                        State::Instance().SCbuffers.push_back(buffer);
-                        buffer->Release();
-                    }
-                }
+                prepareSwapChainBuffers(State::Instance().SCbuffers, pDesc->BufferCount, *ppSwapChain);
             }
 
-            IDXGISwapChain3* sc3 = nullptr;
+            Util::ComPtr<IDXGISwapChain3> sc3;
             do
             {
-                if ((*ppSwapChain)->QueryInterface(IID_PPV_ARGS(&sc3)) == S_OK)
+                if ((*ppSwapChain)->QueryInterface(IID_OUTPTR_ARGS(std::out_ptr(sc3))) == S_OK)
                 {
                     DXGI_COLOR_SPACE_TYPE hdrCS = DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709;
 
@@ -1294,9 +1227,6 @@ static HRESULT hkCreateSwapChainForHwnd(IDXGIFactory* This, IUnknown* pDevice, H
                 }
 
             } while (false);
-
-            if (sc3 != nullptr)
-                sc3->Release();
         }
     }
 
@@ -1318,21 +1248,20 @@ static HRESULT hkCreateDXGIFactory(REFIID riid, IDXGIFactory** ppFactory)
     if (result != S_OK)
         return result;
 
-    IDXGIFactory* real = nullptr;
-    if (!CheckForRealObject(__FUNCTION__, *ppFactory, (IUnknown**) &real))
-        real = *ppFactory;
+    Util::ComPtr<IDXGIFactory> real;
+    if (!CheckForRealObject(__FUNCTION__, *ppFactory, std::out_ptr(real)))
+        real.reset(*ppFactory);
 
     if (oCreateSwapChain == nullptr)
     {
-        void** pFactoryVTable = *reinterpret_cast<void***>(real);
+        void** pFactoryVTable = *reinterpret_cast<void***>(real.get());
 
         oCreateSwapChain = (PFN_CreateSwapChain) pFactoryVTable[10];
 
-        IDXGIFactory2* factory2 = nullptr;
-        if (real->QueryInterface(IID_PPV_ARGS(&factory2)) == S_OK && factory2 != nullptr)
+        Util::ComPtr<IDXGIFactory2> factory2;
+        if (real->QueryInterface(IID_OUTPTR_ARGS(std::out_ptr(factory2))) == S_OK && factory2 != nullptr)
         {
-            pFactoryVTable = *reinterpret_cast<void***>(factory2);
-            factory2->Release();
+            pFactoryVTable = *reinterpret_cast<void***>(factory2.get());
 
             oCreateSwapChainForHwnd = (PFN_CreateSwapChainForHwnd) pFactoryVTable[15];
             oCreateSwapChainForCoreWindow = (PFN_CreateSwapChainForCoreWindow) pFactoryVTable[16];
@@ -1375,21 +1304,20 @@ static HRESULT hkCreateDXGIFactory1(REFIID riid, IDXGIFactory1** ppFactory)
     if (result != S_OK)
         return result;
 
-    IDXGIFactory1* real = nullptr;
-    if (!CheckForRealObject(__FUNCTION__, *ppFactory, (IUnknown**) &real))
-        real = *ppFactory;
+    Util::ComPtr<IDXGIFactory1> real;
+    if (!CheckForRealObject(__FUNCTION__, *ppFactory, std::out_ptr(real)))
+        real.reset(*ppFactory);
 
     if (oCreateSwapChain == nullptr)
     {
-        void** pFactoryVTable = *reinterpret_cast<void***>(real);
+        void** pFactoryVTable = *reinterpret_cast<void***>(real.get());
 
         oCreateSwapChain = (PFN_CreateSwapChain) pFactoryVTable[10];
 
-        IDXGIFactory2* factory2 = nullptr;
-        if (real->QueryInterface(IID_PPV_ARGS(&factory2)) == S_OK && factory2 != nullptr)
+        Util::ComPtr<IDXGIFactory2> factory2;
+        if (real->QueryInterface(IID_OUTPTR_ARGS(std::out_ptr(factory2))) == S_OK && factory2 != nullptr)
         {
-            pFactoryVTable = *reinterpret_cast<void***>(factory2);
-            factory2->Release();
+            pFactoryVTable = *reinterpret_cast<void***>(factory2.get());
 
             oCreateSwapChainForHwnd = (PFN_CreateSwapChainForHwnd) pFactoryVTable[15];
             oCreateSwapChainForCoreWindow = (PFN_CreateSwapChainForCoreWindow) pFactoryVTable[16];
@@ -1432,13 +1360,13 @@ static HRESULT hkCreateDXGIFactory2(UINT Flags, REFIID riid, IDXGIFactory2** ppF
     if (result != S_OK)
         return result;
 
-    IDXGIFactory2* real = nullptr;
-    if (!CheckForRealObject(__FUNCTION__, *ppFactory, (IUnknown**) &real))
-        real = *ppFactory;
+    Util::ComPtr<IDXGIFactory2> real;
+    if (!CheckForRealObject(__FUNCTION__, *ppFactory, std::out_ptr(real)))
+        real.reset(*ppFactory);
 
     if (oCreateSwapChainForHwnd == nullptr)
     {
-        void** pFactoryVTable = *reinterpret_cast<void***>(real);
+        void** pFactoryVTable = *reinterpret_cast<void***>(real.get());
 
         bool skip = false;
 
@@ -1545,9 +1473,9 @@ static void HookToDevice(ID3D12Device* InDevice)
     // Get the vtable pointer
     PVOID* pVTable = *(PVOID**) InDevice;
 
-    ID3D12Device* realDevice = nullptr;
-    if (CheckForRealObject(__FUNCTION__, InDevice, (IUnknown**) &realDevice))
-        pVTable = *(PVOID**) realDevice;
+    Util::ComPtr<ID3D12Device> realDevice;
+    if (CheckForRealObject(__FUNCTION__, InDevice, std::out_ptr(realDevice)))
+        pVTable = *(PVOID**) realDevice.get();
 
     // hudless
     o_D3D12DeviceRelease = (PFN_Release) pVTable[2];
@@ -1802,13 +1730,13 @@ static HRESULT hkD3D11CreateDeviceAndSwapChain(IDXGIAdapter* pAdapter, D3D_DRIVE
         ppDevice != nullptr && *ppDevice != nullptr)
     {
         // check for SL proxy
-        IDXGISwapChain* realSC = nullptr;
-        if (!CheckForRealObject(__FUNCTION__, *ppSwapChain, (IUnknown**) &realSC))
-            realSC = *ppSwapChain;
+        Util::ComPtr<IDXGISwapChain> realSC;
+        if (!CheckForRealObject(__FUNCTION__, *ppSwapChain, std::out_ptr(realSC)))
+            realSC.reset(*ppSwapChain);
 
-        IUnknown* readDevice = nullptr;
-        if (!CheckForRealObject(__FUNCTION__, *ppDevice, (IUnknown**) &readDevice))
-            readDevice = *ppDevice;
+        Util::ComPtr<IUnknown> readDevice;
+        if (!CheckForRealObject(__FUNCTION__, *ppDevice, std::out_ptr(readDevice)))
+            readDevice.reset(*ppDevice);
 
         if (Util::GetProcessWindow() == pSwapChainDesc->OutputWindow)
         {
@@ -1819,7 +1747,7 @@ static HRESULT hkD3D11CreateDeviceAndSwapChain(IDXGIAdapter* pAdapter, D3D_DRIVE
         LOG_DEBUG("Created new swapchain: {0:X}, hWnd: {1:X}", (UINT64) *ppSwapChain,
                   (UINT64) pSwapChainDesc->OutputWindow);
         *ppSwapChain =
-            new WrappedIDXGISwapChain4(realSC, readDevice, pSwapChainDesc->OutputWindow, Present,
+            new WrappedIDXGISwapChain4(realSC.get(), readDevice.get(), pSwapChainDesc->OutputWindow, Present,
                                        MenuOverlayDx::CleanupRenderTarget, HooksDx::ReleaseDx12SwapChain, false);
 
         if (!_skipFGSwapChainCreation)
@@ -1834,22 +1762,13 @@ static HRESULT hkD3D11CreateDeviceAndSwapChain(IDXGIAdapter* pAdapter, D3D_DRIVE
         {
             if (!_skipFGSwapChainCreation)
             {
-                State::Instance().SCbuffers.clear();
-                for (size_t i = 0; i < pSwapChainDesc->BufferCount; i++)
-                {
-                    IUnknown* buffer;
-                    if ((*ppSwapChain)->GetBuffer(i, IID_PPV_ARGS(&buffer)) == S_OK)
-                    {
-                        State::Instance().SCbuffers.push_back(buffer);
-                        buffer->Release();
-                    }
-                }
+                prepareSwapChainBuffers(State::Instance().SCbuffers, pSwapChainDesc->BufferCount, *ppSwapChain);
             }
 
-            IDXGISwapChain3* sc3 = nullptr;
+            Util::ComPtr<IDXGISwapChain3> sc3;
             do
             {
-                if ((*ppSwapChain)->QueryInterface(IID_PPV_ARGS(&sc3)) == S_OK)
+                if ((*ppSwapChain)->QueryInterface(IID_OUTPTR_ARGS(std::out_ptr(sc3))) == S_OK)
                 {
                     DXGI_COLOR_SPACE_TYPE hdrCS = DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709;
 
@@ -1881,9 +1800,6 @@ static HRESULT hkD3D11CreateDeviceAndSwapChain(IDXGIAdapter* pAdapter, D3D_DRIVE
                 }
 
             } while (false);
-
-            if (sc3 != nullptr)
-                sc3->Release();
         }
     }
 
@@ -1895,9 +1811,9 @@ static HRESULT hkD3D11CreateDeviceAndSwapChain(IDXGIAdapter* pAdapter, D3D_DRIVE
 }
 
 #ifdef ENABLE_DEBUG_LAYER_DX12
-static ID3D12Debug3* debugController = nullptr;
-static ID3D12InfoQueue* infoQueue = nullptr;
-static ID3D12InfoQueue1* infoQueue1 = nullptr;
+static Util::ComPtr<ID3D12Debug3> debugController;
+static Util::ComPtr<ID3D12InfoQueue> infoQueue;
+static Util::ComPtr<ID3D12InfoQueue1> infoQueue1;
 
 static void CALLBACK D3D12DebugCallback(D3D12_MESSAGE_CATEGORY Category, D3D12_MESSAGE_SEVERITY Severity,
                                         D3D12_MESSAGE_ID ID, LPCSTR pDescription, void* pContext)
@@ -1915,7 +1831,7 @@ static HRESULT hkD3D12CreateDevice(IDXGIAdapter* pAdapter, D3D_FEATURE_LEVEL Min
 
 #ifdef ENABLE_DEBUG_LAYER_DX12
     LOG_WARN("Debug layers active!");
-    if (debugController == nullptr && D3D12GetDebugInterface(IID_PPV_ARGS(&debugController)) == S_OK)
+    if (debugController == nullptr && D3D12GetDebugInterface(IID_OUTPTR_ARGS(std::out_ptr(debugController))) == S_OK)
     {
         debugController->EnableDebugLayer();
 
@@ -1979,13 +1895,7 @@ static HRESULT hkD3D12CreateDevice(IDXGIAdapter* pAdapter, D3D_FEATURE_LEVEL Min
         State::Instance().d3d12Devices.push_back((ID3D12Device*) *ppDevice);
 
 #ifdef ENABLE_DEBUG_LAYER_DX12
-        if (infoQueue != nullptr)
-            infoQueue->Release();
-
-        if (infoQueue1 != nullptr)
-            infoQueue1->Release();
-
-        if (State::Instance().currentD3D12Device->QueryInterface(IID_PPV_ARGS(&infoQueue)) == S_OK)
+        if (State::Instance().currentD3D12Device->QueryInterface(IID_OUTPTR_ARGS(std::inout_ptr(infoQueue))) == S_OK)
         {
             LOG_DEBUG("infoQueue accuired");
 
@@ -1997,7 +1907,7 @@ static HRESULT hkD3D12CreateDevice(IDXGIAdapter* pAdapter, D3D_FEATURE_LEVEL Min
             // res = infoQueue->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_ERROR, TRUE);
             // res = infoQueue->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_WARNING, TRUE);
 
-            if (infoQueue->QueryInterface(IID_PPV_ARGS(&infoQueue1)) == S_OK && infoQueue1 != nullptr)
+            if (infoQueue->QueryInterface(IID_OUTPTR_ARGS(std::inout_ptr(infoQueue1))) == S_OK && infoQueue1 != nullptr)
             {
                 LOG_DEBUG("infoQueue1 accuired, registering MessageCallback");
                 res = infoQueue1->RegisterMessageCallback(D3D12DebugCallback, D3D12_MESSAGE_CALLBACK_IGNORE_FILTERS,
