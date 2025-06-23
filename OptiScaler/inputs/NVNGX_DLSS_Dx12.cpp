@@ -317,11 +317,13 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D12_Init_Ext(unsigned long long InApp
     if (orgSetComputeRootSignature == nullptr)
     {
         Util::ComPtr<ID3D12CommandAllocator> alloc;
-        auto result = InDevice->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_OUTPTR_ARGS(std::out_ptr(alloc)));
+        auto result =
+            InDevice->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_OUTPTR_ARGS(std::out_ptr(alloc)));
         if (result == S_OK)
         {
             Util::ComPtr<ID3D12GraphicsCommandList> gcl;
-            result = InDevice->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc.get(), NULL, IID_OUTPTR_ARGS(std::out_ptr(gcl)));
+            result = InDevice->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc.get(), NULL,
+                                                 IID_OUTPTR_ARGS(std::out_ptr(gcl)));
             if (result == S_OK)
             {
                 HookToCommandList(gcl.get());
